@@ -1,0 +1,19 @@
+# Never commit copyrighted game material
+*.apk
+*.obb
+*.pak
+*.rpk
+*.exe
+*.so
+*.dex
+*.keystore
+*.jks
+
+# Working files
+*.elf
+*.sym
+*.str
+/out/
+/work/
+__pycache__/
+*.pyc

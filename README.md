@@ -1,0 +1,456 @@
+# Acrodea VIVID Runtime - DRM analysis & format documentation
+
+Reverse-engineering notes on **Acrodea VIVID Runtime**, the portable-binary game platform behind
+the Japanese **G-Gee (Gゲー)** store (GMO Internet / Acrodea, ~2010-2017). It documents the
+package formats, the rights-object key model, and a **negative result**: the game content is
+protected by ordinary, correctly-implemented AES + RSA whose content key never existed on the
+device, so it cannot be recovered from client code alone.
+
+Worked example throughout: `com.ggee.vividruntime.gg_1642` (*Dead Shot Zombies 2*, v13.09.00).
+The runtime, the container format and the DRM are shared across titles, so most of this applies
+to the rest of the G-Gee catalogue.
+
+**No copyrighted binaries or game assets are distributed here.** This is analysis, plus tooling
+that only operates on files you already have. The G-Gee servers have been offline since ~2017;
+this is preservation research on an abandoned platform.
+
+---
+
+## TL;DR
+
+| Layer | Status |
+|---|---|
+| `35 21 14 14` LZMA wrapper (libraries, bootstrap, rpk members) | **Fully documented, no DRM** |
+| Package/zip container + signature manifest | **Fully documented** |
+| Rights-object key model (`/ro/cek`, RSA wrapping, device binding) | **Fully documented** |
+| `fsPacked` inner scramble (keyless `rand()` LCG) | **Fully reversed, constants below** |
+| **Outer AES over the content region** | **Not recoverable.** Key was server-side only |
+
+What separates an archived package from a running game is one AES key, generated on a server
+that no longer exists. Roughly **2.84 million** key candidates were tested against a
+known-plaintext oracle, all negative. See
+[Key-recovery attempts](#7-key-recovery-attempts-all-negative).
+
+---
+
+## 1. Platform overview
+
+VIVID Runtime is a **portable-binary execution environment**: games ship as architecture-neutral
+`.exe` / `.so` objects that the runtime relocates and executes itself, rather than as native
+Android code. Acrodea's own description is in the TDC2013 Tizen conference deck,
+[*VIVID Runtime and Secured Content Delivery System on Tizen*](https://cdn.download.tizen.org/misc/media/conference2013/slides/TDC2013-Acrodeas_Vivid_Runtime_solution_on_Tizen.pdf)
+(slides 16-17 cover the DRM).
+
+On Android the stack is:
+
+```
+APK  ├─ classes.dex                 Java launcher, store/billing, Play expansion downloader
+     ├─ lib/armeabi/libacrodea_runtime.so   JNI bridge + object loader + fs_packed
+     └─ assets/lib4_5_0/            bootstrap.exe + libc/libm/libstdc++/... (LZMA-wrapped)
+
+expansion package (.obb)  ├─ config.xml, <Title>.exe, res.pak, lib*.so   ← encrypted region
+                          ├─ rpk/lib4_6_3.rpk                            ← plaintext
+                          └─ signature.xml                               ← plaintext
+```
+
+`bootstrap.exe` is the portable loader, `res.pak` is the game content archive, and
+`lib4_6_3.rpk` is the (unprotected) runtime library bundle.
+
+### JNI surface
+
+The Java layer drives the native runtime through `com.acrodea.vividruntime.launcher.Runtime`:
+
+| Native method | Role |
+|---|---|
+| `install(...)` | Decrypt + install a package into app storage |
+| `rorequest(...)` / `roinstall(...)` | Fetch / store a rights object |
+| `verify(...)` | **Integrity only.** Checks SHA-256 against the signed manifest, offline |
+| `getPackData` / `getPackDataSize` | Read an entry out of `res.pak` |
+
+`verify` takes no device identity and contacts nothing, since the certificate is inside the
+package. Only `install` needs the rights object.
+
+---
+
+## 2. The `35 21 14 14` LZMA wrapper
+
+Every VIVID library, `bootstrap.exe`, and each `.rpk` member uses one wrapper:
+
+```
+magic  35 21 14 14      (4 bytes)
+size   uint32 LE        (uncompressed size)
+body   raw LZMA1 (alone) stream
+```
+
+```python
+import lzma
+
+def unwrap(data: bytes) -> bytes:
+    assert data[:4] == b'\x35\x21\x14\x14'
+    p = data[8:]
+    # size field must be replaced with 0xFF*8 ("unknown"): the stream carries an
+    # end-of-stream marker, and liblzma rejects a known size together with a marker.
+    return lzma.LZMADecompressor(format=lzma.FORMAT_ALONE).decompress(
+        p[:5] + b'\xff' * 8 + p[5:]
+    )
+```
+
+Unwrapping `assets/lib4_5_0/bootstrap.exe` yields a **32-bit ARM ELF** (~1.58 MB). Load *that*
+in Ghidra/IDA; the raw `.exe` is just the wrapper and disassembles to garbage. Suggested
+language: `ARM:LE:32:v7`.
+
+`.rpk` files are plain ZIPs whose members are individually wrapped, with hashed member names
+plus a `config.xml`, `icon.png`, and `signature.xml`.
+
+---
+
+## 3. Package container and signature manifest
+
+The expansion package is a ZIP with a **32-byte header prepended**, so every offset in the ZIP
+structures is shifted by `0x20` relative to the file. Parse the central directory at its real
+location and add `0x20` to each local-header offset.
+
+For the worked example (37,393,698 bytes total):
+
+* Encrypted region: `[0x00000000, 0x0231ea11)`, the 32-byte header plus the first 12 entries
+  (`config.xml`, `DSZv2.exe`, `icon.png`, all `lib*.so`, `res.pak`), **local headers included**.
+  A full `PK\x03\x04` scan finds no local headers below `0x231ea11`.
+* Plaintext tail: `rpk/lib4_6_3.rpk` and `signature.xml`.
+* Plaintext length is `0x231e9f1`, **not** a multiple of 16, and ciphertext is exactly 32 bytes
+  longer, so there is no block padding. Consistent with CTR-family or CBC-CTS plus a 32-byte
+  IV/nonce header.
+
+### `signature.xml`
+
+Standard XMLDSig, `rsa-sha256`, one `<Reference>` per entry, signed by a per-title certificate
+(`CN=<title id>`) chained to an **"Acrodea Root CA"** (Acrodea Inc., Europe Branch, Helsinki).
+
+The digests are computed over the **plaintext** of each entry, which gives two things:
+
+1. A ready-made **verification oracle**: any candidate decryption can be checked instantly
+   against the signed digest.
+2. Proof that decrypted content is **not device-specific**. The signed digest is a fixed
+   constant shipped identically to every user, so the correct plaintext is byte-identical for
+   everyone. See [§5](#5-imei-is-identity-not-the-key).
+
+---
+
+## 4. The DRM key model
+
+Extracted from the unwrapped `bootstrap.exe`, which statically links **Crypto++**: Rijndael with
+**GCM / CTR / CBC-CTS**, plus RSA-OAEP and a DL/ECIES-style hybrid (`P1363_KDF2<SHA1>`,
+`DL_EncryptionAlgorithm_Xor<HMAC<SHA1>>`). The runtime `.so` carries only libtomcrypt
+`rsa_verify_hash_ex` + `sha256_desc` and **no symmetric cipher**, so content decryption happens
+in `bootstrap.exe`.
+
+Its string table exposes the whole schema:
+
+```
+/ro/cek                      content encryption key   ← the AES key for the content region
+/ro/pek                      package encryption key
+/ro/device_id                binds the RO to one device
+/ro/uuid, /ro/cont_uuid, /ro/app_id, /ro/build, /ro/pub_time
+/ro/constraint/{count,duration,interval,total,option}   trial / rental limits
+/ro_request/{device_id,public_key}     device → server
+/ro_response/{key,payload}             server → device
+/data/keystore.dat           device's OWN generated RSA private key
+/data/datastore.dat          cached rights object
+drm_ro_request.xsd,  "DRM Failure: ",  Security::Errors::DRMError
+```
+
+Driver: `Security::ExeDRMHandler::postLoadHook` plus a statically-linked `LDValidator` engine and
+`Security::ROConstraintChecker` (`s_isValid`, `s_getRemainCount`, `s_getRemainTime`, …).
+
+### Provisioning flow
+
+1. Device generates **its own RSA keypair** (`/data/keystore.dat`; `read /dev/random`,
+   `InvertibleRSAFunction` private-key ops are present).
+2. Device sends `device_id` + its **public key** (`/ro_request`). `device_id` is an HMAC-SHA256
+   fingerprint of IMEI/IMSI/MAC, produced in the Java layer by `com.ggee.utils.service.v` with
+   the embedded key `j5d!sf%w08gfy#tf`.
+3. Server returns a rights object whose payload is **hybrid-encrypted to that public key**
+   (`/ro_response/key` + `/ro_response/payload`), carrying the **CEK**.
+4. `bootstrap.exe` unwraps with the device private key → CEK → decrypts the content region.
+   The RO is cached in `datastore.dat`, so launches work offline afterwards.
+
+**The client reads the CEK from `/ro/cek`. It never derives it.** There is no KDF from device
+identity to content key anywhere in the binaries.
+
+---
+
+## 5. IMEI is identity, not the key
+
+The TDC2013 slides say the key is "generated on the basis of User ID (IMSI, IMEI, etc.)", which
+reads as if content were encrypted per-device. It isn't, and that reading is the most natural
+wrong turn to take here.
+
+There are two separate keys:
+
+* **CEK**, which encrypts the content. Random, and **global** (one value for the title).
+* **Device binding**, which wraps the CEK for one device. This is what device identity selects.
+
+Why per-device content encryption can't be true: on Android these titles ship the content as a
+**Google Play expansion file** (the APK bundles `com.google.android.vending.expansion.downloader`,
+and the file uses the standard `main.<versionCode>.<package>.obb` naming). Google serves that
+file **byte-identical to every user**, and one static blob cannot be encrypted under billions of
+different IMEIs. The manifest also signs a fixed plaintext digest ([§3](#signaturexml)), which is
+only possible if the intended plaintext is universal.
+
+Device identity decided *which rights object was yours*, not *how the content was encrypted*.
+Knowing an IMEI buys nothing: the content was never encrypted with one, the CEK isn't derived
+from one, and the actual wrapping key is a random device-generated RSA key.
+
+---
+
+## 6. `res.pak` has two layers
+
+### Outer: AES over the whole content region
+
+Key = `/ro/cek`. See above. This is the layer that can't be broken.
+
+### Inner: a keyless `rand()` LCG scramble
+
+Each entry inside `res.pak` is XOR-scrambled by `fs_packed::fsPacked_randomize` in
+`libacrodea_runtime.so`, using the **classic ANSI-C `rand()` constants**, with no key at all:
+
+```c
+/* MULT = 0x41c64e6d, INC = 0x3039  (glibc/ANSI C rand()) */
+seed = (pos & 0x7fffffff) * MULT + INC;
+for (i = 0; i + 1 < len; i += 2) {
+    seed = seed * MULT + INC;
+    *(uint16_t *)(buf + i) ^= (uint16_t)(seed >> 8);
+}
+if (i < len)
+    buf[i] ^= (uint8_t)(((seed * MULT + INC) >> 8) & 0xff);
+```
+
+Read path:
+
+```
+JNI Runtime.getPackData
+  → RuntimeContext::getPackData
+    → __fsPackedLoadEntries / __fsPackedGetFileSize / __fsPackedReadFile
+      → fs_packed::fsPacked::readFile
+        → fs_packed::fsPacked_randomize      (unscramble)
+```
+
+It is weak, but it sits **behind** the AES layer, so it protects nothing in practice. It was
+explicitly ruled out as the outer layer: 4M+ LCG seeds × 7 candidate header offsets were brute
+forced against the known plaintext with zero hits.
+
+This still matters for one reason. Once an AES-decrypted package surfaces, its entries are fully
+recoverable with the constants above, with no server, key or rights object involved.
+
+### What an installed (decrypted) `res.pak` looks like
+
+Verified against a real installed package from a preserved device dump:
+
+* Magic `4F 49` (`"OI"`) followed by a structured entry table.
+* Entropy **2.05-6.92** bits/byte across the file (structure + compressed assets), *not* the flat
+  ~8.0 of an encrypted blob.
+
+That is the signature of the artifact worth hunting for. The `res.pak` inside an installed game
+directory, on a device that installed the title while the servers were alive, is the
+**already-decrypted** form. See
+[Where installed titles live on disk](#where-installed-titles-live-on-disk) for the two possible
+locations.
+
+---
+
+## 7. Key-recovery attempts, all negative
+
+### The oracle
+
+A package's first encrypted bytes are the ZIP local file header of the first entry, and every
+field in it (signature, version, flags, method, mtime, CRC-32, sizes, name length, name) is
+recoverable from the **central directory**, which sits in the plaintext tail. So ~40 bytes of
+known plaintext at plaintext offset 0 are free, and any key/mode guess is verifiable instantly.
+
+```python
+import struct
+# from the central-directory record of the first entry:
+lfh = struct.pack('<IHHHHHIIIHH', 0x04034b50, vne, flag, method, mtime, mdate,
+                  crc32, csize, usize, len(name), 0) + name
+```
+
+### What the ciphertext looks like
+
+| Measurement | Result |
+|---|---|
+| Shannon entropy over the region | **7.99999** bits/byte |
+| Repeated 16-byte blocks (ECB leak) | **0** out of 2,301,601 |
+| χ² over 256 bins | 404 |
+
+No structure, no block reuse, no ECB. Consistent with a correct stream/CTR-family cipher.
+
+### Sweeps run
+
+| Candidate set | Tests | Hits |
+|---|---|---|
+| Metadata-derived keys (title id, package, uuids, filenames, MD5/SHA/double-hash variants, all keys embedded in `classes.dex`) | 516 | 0 |
+| Exhaustive byte-aligned 16/32-byte windows in `bootstrap.exe` (`.text/.rodata/.data/.data.rel.ro`) | 1,743,286 | 0 |
+| Same sweep over `libacrodea_runtime.so` | 1,093,673 | 0 |
+| LCG seeds × header offsets (is the outer layer just the weak scramble?) | 4M+ | 0 |
+
+Modes covered: ECB, CBC, CTR, OFB, CFB, across three IV candidates, **plus an IV-independent CBC
+test** (`AES_dec_K(C₁) ⊕ C₀ == P₁`) that would find the right key regardless of IV.
+
+**~2.84 million tests, zero hits**, which is what a properly random server-side key looks like.
+All AES keys embedded in `classes.dex` are also demonstrably local-use (device-ID HMAC,
+in-app-billing payload, ad session, Google LVL obfuscator) and none relate to content.
+
+---
+
+## 8. Compatibility notes (for anyone booting the runtime)
+
+Measured from `.ARM.attributes`:
+
+| Binary | `Tag_CPU_arch` | `e_flags` |
+|---|---|---|
+| `libacrodea_runtime.so` | **6** (ARM v6) | `0x5000000` (soft-float) |
+| `bootstrap.exe` (unwrapped) | **4** (ARMv5TE) | `0x5000002` |
+
+Shipping APKs contain **`lib/armeabi` only**, with no `armeabi-v7a` and no `arm64-v8a`. That ABI
+was removed from the NDK in r17 (2018) and modern devices report `Build.SUPPORTED_ABIS` as
+`[arm64-v8a, armeabi-v7a]` or `[armeabi-v7a]`, so `armeabi`-only natives are never loaded today.
+Re-homing the same v6/v5TE binaries under `armeabi-v7a` is enough, since ARM is backwards
+compatible and the directory name selects the loader path, not the ISA.
+
+**Hard requirement: a device that still has 32-bit (AArch32) execution.** The whole stack
+(loader, runtime, game executable) is closed-source 32-bit ARM with no source available, so it
+can't be rebuilt for arm64. Any device retaining AArch32 works, which covers most phones through
+~2023 whether 64-bit or not. **64-bit-only** devices and images cannot run it, and no
+compatibility shim changes that; it would take a full ARM32→ARM64 translation layer.
+
+Two runtime notes worth knowing if you're bringing this up on a modern OS:
+
+* The runtime resolves `ZipFileRO` symbols out of `libutils.so` via `dlopen`/`dlsym`. Modern
+  Android removed `ZipFileRO` from `libutils.so` entirely.
+* `ZipFileRO::open` is called as a **non-static member** (`open(this, path)`, Android 2.3 style),
+  with the object allocated and hand-initialised by the caller. A static factory mangles to the
+  same symbol and links silently while shifting every argument by one register.
+
+### Real `config.xml` shape
+
+Recovered from a preserved (decrypted) package of a sister title:
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<application xmlns="http://www.acrodea.com/ns/application/1.0"
+             build="20121030" id="1761" platformversion="120700" version="1.0">
+  <executable>GhostTrick.exe</executable>
+  <libraries>lib4_6_3</libraries>
+  <orientation>landscape</orientation>
+  <icons>
+    <icon height="90" width="90">icon_large.png</icon>
+    <icon height="90" width="90">icon_middle.png</icon>
+    <icon height="90" width="90">icon_small.png</icon>
+  </icons>
+  <profile><in_app_billing>true</in_app_billing></profile>
+</application>
+```
+
+Useful diagnostic: with a valid `config.xml` present but content missing, the loader fails with
+`0x0e030300` (short read; `fs_packed` falls back to loose-directory mode and the loader ends up
+`fopen`-ing a *directory*, whose `fread` returns 0). With no `config.xml` at all,
+`bootstrap.exe`'s entry point returns `0xffffffff` because it doesn't know what to load.
+
+---
+
+## 9. DRM-as-gate vs DRM-as-encryption
+
+The platform's **online gates** (license/entitlement checks, ticket and login flows,
+connectivity tests) are ordinary policy checks: a boolean, a branch, a server round-trip. Each
+one dies to a one-line patch, and historically they did.
+
+The **content encryption** is a different category. It isn't asking a question you can answer
+wrongly, it's withholding information you don't have. You can branch past a license test. You
+cannot branch past a cipher, and no amount of patching or compute substitutes for a 128-bit key
+generated on a machine that has been offline since 2017.
+
+Everything gate-shaped in VIVID Runtime was defeated long ago. The one encryption-shaped thing
+is closed.
+
+*(This repository documents the concept rather than publishing a step-by-step bypass recipe for
+the store/licensing checks.)*
+
+---
+
+## 10. Can this ever be recovered?
+
+**By breaking the crypto: no.**
+
+* AI doesn't help. A random key has no pattern to learn; this is an absence of information, not
+  a hard puzzle.
+* Classical brute force is 2¹²⁸.
+* Quantum (Grover) halves the exponent to ~2⁶⁴ for AES-128, still infeasible, irrelevant for
+  AES-256, and nobody is aiming a quantum computer at a defunct mobile game.
+
+**By the artifact resurfacing: yes.** This is data archaeology, not cryptanalysis. What's needed
+is either:
+
+1. the installed game directory from a device (or backup) that installed the title while the
+   servers were alive (~2013-2017), containing the **already-decrypted** `res.pak`,
+   `<Title>.exe`, and `config.xml`; or
+2. that device's `datastore.dat` (rights object) + `keystore.dat` (its RSA private key) +
+   device id, from which the CEK can be unwrapped.
+
+Because the CEK is global and the signed digest is fixed, **a decrypted package from any one
+device is valid for everyone**: the encryption *was* the device binding, and once removed the
+plaintext is universal. Verify any candidate against the digest in `signature.xml`.
+
+### Where installed titles live on disk
+
+Two different roots exist, and which one a title uses depends on how it was installed. Both
+constants appear in the same codebase, because the same runtime library serves both modes:
+
+| Install route | Content root |
+|---|---|
+| G-Gee launcher / store app (`com.acrodea.gamecenter`) | `/sdcard/RuntimeApps/<id>/` |
+| Standalone per-title APK (Google Play) | `/sdcard/Android/data/<package>/files/<id>/` |
+
+Under either root the layout is the same: `config.xml`, `<Title>.exe`, `res.pak`, `res/`,
+`rpk/<runtime lib>.rpk`, `signature.xml`, plus `data/` and `secure/` for save data. **Check both
+locations** when searching a device or backup.
+
+### Preservation status
+
+Community dumps of installed G-Gee game directories exist on the Internet Archive, covering at
+least Devil May Cry 4 Refrain (1760), Ghost Trick (1761), Disgaea (705) and Shantae (1277).
+These appear as `RuntimeApps/<id>/` trees with `res.pak` present as a normal file.
+
+Scope of what has actually been checked here: **one** `res.pak` from such a dump was inspected
+and is definitively **not encrypted** (magic `4F 49`, entropy 2.05-6.92 bits/byte across the
+file, versus the flat ~7.9999 of the encrypted region). One of these uploads is additionally
+labelled "tested and working" by its uploader. The remaining titles have *not* been individually
+verified as complete or playable, so treat the list as "dumps exist and at least one is
+genuinely decrypted", not as a guarantee for each title. Sizes in the hundreds of MB are
+expected, since that is the full decrypted asset archive.
+
+No decrypted copy is known for many other titles, including the one used as the worked example
+in this document.
+
+If you have an old Android device or backup with G-Gee games installed, that game directory is
+the thing worth saving. Once the servers died, it became unreproducible.
+
+---
+
+## Repository scope
+
+* Analysis and format documentation (this file).
+* Tooling that operates on files you supply: LZMA unwrapper, container/central-directory parser,
+  known-plaintext oracle, embedded-key sweeper, `fsPacked` LCG descrambler.
+* **Not included:** any APK, expansion package, `res.pak`, game asset, or other copyrighted
+  binary, and no signing keys.
+
+## Credits
+
+Parts of the analysis, tooling and documentation in this repository were produced
+with the help of [Claude](https://claude.com/claude-code) (Anthropic): the
+known-plaintext oracle and key sweeps, the Ghidra tracing of the DRM path and the
+`fs_packed` scramble, and this write-up.
+
+## License
+
+Code: MIT. Documentation: CC BY 4.0. Trademarks and game content belong to their respective
+owners; this project is unaffiliated with Acrodea, GMO Internet, or any publisher.
