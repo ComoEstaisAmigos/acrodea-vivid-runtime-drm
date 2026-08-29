@@ -131,8 +131,9 @@ For the worked example (37,393,698 bytes total):
   A full `PK\x03\x04` scan finds no local headers below `0x231ea11`.
 * Plaintext tail: `rpk/lib4_6_3.rpk` and `signature.xml`.
 * Plaintext length is `0x231e9f1`, **not** a multiple of 16, and ciphertext is exactly 32 bytes
-  longer, so there is no block padding. Consistent with CTR-family or CBC-CTS plus a 32-byte
-  IV/nonce header.
+  longer, so there is no block padding. The cipher is **AES-GCM**
+  ([§5](#5-the-local-key-stores-open-offline)); how those 32 bytes divide into IV and tag for
+  this region is still open, see the note in [§7](#7-key-recovery-attempts-all-negative).
 
 ### `signature.xml`
 
@@ -150,8 +151,11 @@ bytes for entries that ship encrypted.
 > manifest's 1,329 `<Reference>` entries. Treat these digests as packaging checksums, not as a way
 > to validate a candidate decryption.
 >
-> The real oracle is the cipher itself: content is `IV(16) ‖ ciphertext ‖ GCM tag(16)`, so a
-> correct CEK authenticates itself ([§5](#5-the-local-key-stores-open-offline)).
+> The real oracle is the cipher itself. An individually encrypted content file (the form an
+> installed title stores its executable in) is `IV(16) ‖ ciphertext ‖ GCM tag(16)`, so a correct
+> CEK authenticates itself ([§5](#5-the-local-key-stores-open-offline)). The packaged region
+> above is laid out differently, since it is length-preserving in place; that layout is the open
+> question noted in [§7](#7-key-recovery-attempts-all-negative).
 
 Content still being **universal** (not per-device) does not depend on that retracted claim. It
 follows from the package being a static Google Play expansion file served byte-identically to
@@ -313,8 +317,8 @@ Every step is checked by a GCM authentication tag, so nothing here is guesswork:
 | 7 | content file | AES-256-GCM with the CEK | plaintext |
 
 `tools/ggee_drm.py` runs the whole thing. Verified end to end on the publicly archived
-**Shantae: Risky's Revenge** (`com.ggee.vividruntime.gs_1277`, v12.04.03) install: the CEK came out, and
-`iShantae.exe` decrypted - GCM tag verified - to a valid ARM ELF (`e_machine=40`,
+**Shantae: Risky's Revenge** (`com.ggee.vividruntime.gs_1277`, v12.04.03) install: the CEK came
+out, and `iShantae.exe` decrypted - GCM tag verified - to a valid ARM ELF (`e_machine=40`,
 `e_flags=0x5000002`, ARMv5TE soft-float). The same CEK applied to Ghost Trick's `.exe` fails the
 tag, as it must: **the CEK is per title**. (No key material from that dump is reproduced here,
 only that the method works on it.)
@@ -440,7 +444,8 @@ lfh = struct.pack('<IHHHHHIIIHH', 0x04034b50, vne, flag, method, mtime, mdate,
 | Repeated 16-byte blocks (ECB leak) | **0** out of 2,301,601 |
 | χ² over 256 bins | 404 |
 
-No structure, no block reuse, no ECB. Consistent with a correct stream/CTR-family cipher.
+No structure, no block reuse, no ECB. Consistent with a correct counter-mode cipher, which is
+what GCM is.
 
 ### Sweeps run
 
@@ -631,9 +636,10 @@ the store/licensing checks.)*
 
 * AI doesn't help. A random key has no pattern to learn; this is an absence of information, not
   a hard puzzle.
-* Classical brute force is 2¹²⁸.
-* Quantum (Grover) halves the exponent to ~2⁶⁴ for AES-128, still infeasible, irrelevant for
-  AES-256, and nobody is aiming a quantum computer at a defunct mobile game.
+* The CEK is **AES-256** (the rights object states `bits="256"`), so classical brute force is
+  2²⁵⁶.
+* Quantum (Grover) only halves the exponent, to 2¹²⁸, which is still far out of reach, and
+  nobody is aiming a quantum computer at a defunct mobile game.
 
 **By the artifact resurfacing: yes**, and the artifact is now much smaller than it used to be.
 This is data archaeology, not cryptanalysis. Either of these works:
@@ -646,7 +652,7 @@ This is data archaeology, not cryptanalysis. Either of these works:
    `tools/ggee_drm.py`, see [§5](#5-the-local-key-stores-open-offline).
 
 Option 2 is the realistic one. Those files live under
-`/data/data/<package>/` and total **about 2 kB**, which is exactly what
+`/data/data/<package>/` and total **under 3 kB**, which is exactly what
 Titanium Backup, `adb backup` and rooted `/data/data` copies preserve, and exactly the kind of
 thing that survives in old phone backups when a several-hundred-megabyte game directory does not.
 Reading them off a device needs root; restoring an old backup image does not.
@@ -654,8 +660,8 @@ Reading them off a device needs root; restoring an old backup image does not.
 Because the CEK is global, **a decrypted package from any one device is valid for everyone**: the
 encryption *was* the device binding, and once removed the plaintext is universal.
 
-Verify a candidate decryption by its **GCM tag**, not by `signature.xml`, those digests cover the
-as-shipped (encrypted) form, see the correction in [§3](#signaturexml).
+Verify a candidate decryption by its **GCM tag**, not by `signature.xml`. Those digests cover the
+as-shipped (encrypted) form; see the correction in [§3](#signaturexml).
 
 ### Where installed titles live on disk
 
