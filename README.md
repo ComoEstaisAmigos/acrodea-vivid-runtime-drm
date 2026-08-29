@@ -356,10 +356,27 @@ It describes the *library bundle*, not the game: `id` is the library name, and t
 corroborates the ABI measurement above — Acrodea's own label for the bundle is **`armv5`**.
 
 **2. A reconstructed app config**, same namespace and attribute layout, with the app-specific
-fields filled in: the title `id`, `<executable><Title>.exe</executable>`,
-`<libraries><runtime lib></libraries>` (replacing the library file's `lib=` attribute), and a
-`platformversion`. For reference, the genuine shape recovered from a preserved (decrypted)
-package of another title:
+fields filled in: the title `id`, `<executable>`, and `<libraries>` (replacing the library
+file's `lib=` attribute). For the worked example of this document,
+`com.ggee.vividruntime.gg_1642`, that is:
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<application xmlns="http://www.acrodea.com/ns/application/1.0"
+             build="20130903" id="1642" platformversion="130900" version="13.09.00">
+  <executable>DSZv2.exe</executable>
+  <libraries>lib4_6_3</libraries>
+  <orientation>landscape</orientation>
+  <profile><in_app_billing>true</in_app_billing></profile>
+</application>
+```
+
+`id` and `<executable>` are the fields that matter, and both are readable without the CEK:
+the entry names sit in the ZIP central directory, which is in the plaintext tail. `build`,
+`version` and `platformversion` here are invented and were verified not to affect behaviour.
+
+For comparison, a **genuine** app config, recovered intact from a preserved (decrypted)
+package of a different title. Note the icon list, which a reconstruction has no way to know:
 
 ```xml
 <?xml version="1.0" encoding="utf-8"?>
