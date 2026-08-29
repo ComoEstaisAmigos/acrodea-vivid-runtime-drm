@@ -632,14 +632,9 @@ the store/licensing checks.)*
 
 ## 10. Can this ever be recovered?
 
-**By breaking the crypto: no.**
-
-* AI doesn't help. A random key has no pattern to learn; this is an absence of information, not
-  a hard puzzle.
-* The CEK is **AES-256** (the rights object states `bits="256"`), so classical brute force is
-  2²⁵⁶.
-* Quantum (Grover) only halves the exponent, to 2¹²⁸, which is still far out of reach, and
-  nobody is aiming a quantum computer at a defunct mobile game.
+**By breaking the crypto: no.** The CEK is **AES-256** (the rights object states `bits="256"`)
+and randomly generated server-side, so there is no structure to exploit and nothing to do but
+search 2²⁵⁶ keys.
 
 **By the artifact resurfacing: yes**, and the artifact is now much smaller than it used to be.
 This is data archaeology, not cryptanalysis. Either of these works:
