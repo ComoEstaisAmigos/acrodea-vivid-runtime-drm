@@ -252,6 +252,15 @@ On the Wi-Fi path the app caches that MAC in its own `SharedPreferences` under `
 (AES/ECB/PKCS5 with an app-embedded key), so **a dump that includes `shared_prefs/` carries its
 own identity**, nothing needs to be known about the device from outside.
 
+Which value you get depends on the Android version the install ran on:
+
+* **Android 5 and earlier** (so, every install made while the servers were alive): the real
+  hardware Wi-Fi MAC. It differs per device, and the cached `PREF_MAC_ADDR` is the way to get it.
+* **Android 6 and later**: `WifiManager.getMacAddress()` was locked down and returns the constant
+  `02:00:00:00:00:00` to every app, so the identity is always `MACW:020000000000`. Confirmed on
+  an Android 12 handset, where a freshly generated `keystore.dat` opened under exactly that
+  string. For any modern install the identity is therefore fixed and needs no recovery at all.
+
 ### Store encryption
 
 Both stores use the same construction:
@@ -341,8 +350,10 @@ ships plaintext content, which never involves an on-device rights object at all.
 
 ### Limits
 
-* **Identity must be recoverable.** The brute-force fallback below only helps when the identity
-  derives from something readable off the device. Observed counter-example: on a rooted
+* **Identity must be recoverable.** This only bites on Android 5 and earlier, where the identity
+  is the real hardware MAC; from Android 6 it is the fixed `MACW:020000000000`. The brute-force
+  fallback below only helps when the identity derives from something readable off the device.
+  Observed counter-example: on a rooted
   BlueStacks 0.7.3.766 (Android 2.3.4) image, a freshly installed title generated a valid
   `keystore.dat` on demand, but wrote no `PREF_MAC_ADDR`, exposed no telephony service, and the
   file opened under **none** of the readable identifiers (emulated Wi-Fi MAC, eth0 MAC, serial,
@@ -650,7 +661,34 @@ Option 2 is the realistic one. Those files live under
 `/data/data/<package>/` and total **under 3 kB**, which is exactly what
 Titanium Backup, `adb backup` and rooted `/data/data` copies preserve, and exactly the kind of
 thing that survives in old phone backups when a several-hundred-megabyte game directory does not.
-Reading them off a device needs root; restoring an old backup image does not.
+
+**No root required.** These APKs do not set `android:allowBackup`, so the platform default
+(`true`) applies and `adb backup` will hand over the app's private data directory:
+
+```
+adb backup -f title.ab -noapk com.ggee.vividruntime.<id>
+```
+
+Confirm the prompt on the device (leaving the password empty), then unpack the archive: it is a
+short text header, then a zlib stream, then a tar.
+
+```python
+import zlib, tarfile
+d = open("title.ab", "rb").read()
+i = 0
+for _ in range(4):            # "ANDROID BACKUP\n<ver>\n<compressed>\n<encryption>\n"
+    i = d.index(b"\n", i) + 1
+open("title.tar", "wb").write(zlib.decompress(d[i:]))
+tarfile.open("title.tar").extractall()
+```
+
+`runtime/keystore.dat` and `runtime/datastore.dat` land under `apps/<package>/r/`, and the
+`SharedPreferences` under `apps/<package>/sp/`. Verified on an Android 12 handset: a non-rooted
+`adb backup` produced a working `keystore.dat` that `tools/ggee_drm.py` opened, yielding a valid
+PKCS#8 RSA-1024 device key.
+
+`adb backup` exists from Android 4.0 and is deprecated but still functional; Android 12 and later
+warn, and some OEM builds disable it. Restoring an old backup image needs nothing at all.
 
 Because the CEK is global, **a decrypted package from any one device is valid for everyone**: the
 encryption *was* the device binding, and once removed the plaintext is universal.
