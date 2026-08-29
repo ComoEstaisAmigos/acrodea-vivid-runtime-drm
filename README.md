@@ -2,9 +2,15 @@
 
 Reverse-engineering notes on **Acrodea VIVID Runtime**, the portable-binary game platform behind
 the Japanese **G-Gee (Gゲー)** store (GMO Internet / Acrodea, ~2010-2017). It documents the
-package formats, the rights-object key model, and a **negative result**: the game content is
-protected by ordinary, correctly-implemented AES + RSA whose content key never existed on the
-device, so it cannot be recovered from client code alone.
+package formats and the rights-object key model, and it contains one negative and one positive
+result:
+
+* **Negative:** the content key (CEK) is a server-generated random AES-256 value that never
+  existed in client code, so it cannot be recovered from the package alone.
+* **Positive ([§5](#5-the-local-key-stores-open-offline)):** the *rights object that carries the
+  CEK* is stored on the device, and its protection is recoverable offline. Given a preserved
+  install's `runtime/{keystore,datastore}.dat` — about 2 kB — that title's CEK falls out with no
+  server contact, and its content decrypts with a verified authentication tag.
 
 Worked example throughout: `com.ggee.vividruntime.gg_1642` (*Dead Shot Zombies 2*, v13.09.00).
 The runtime, the container format and the DRM are shared across titles, so most of this applies
@@ -24,12 +30,20 @@ this is preservation research on an abandoned platform.
 | Package/zip container + signature manifest | **Fully documented** |
 | Rights-object key model (`/ro/cek`, RSA wrapping, device binding) | **Fully documented** |
 | `fsPacked` inner scramble (keyless `rand()` LCG) | **Fully reversed, constants below** |
-| **Outer AES over the content region** | **Not recoverable.** Key was server-side only |
+| **On-device key stores** (`keystore.dat`, `datastore.dat`) | **Broken offline** ([§5](#5-the-local-key-stores-open-offline)) |
+| **Outer AES over the content region** | Key not in the package; **recoverable from a device dump** |
 
-What separates an archived package from a running game is one AES key, generated on a server
-that no longer exists. Roughly **2.84 million** key candidates were tested against a
-known-plaintext oracle, all negative. See
-[Key-recovery attempts](#7-key-recovery-attempts-all-negative).
+Nothing here breaks AES. What it breaks is the *envelope*: the CEK is delivered inside a rights
+object cached on the device, and that object's protection turns out to be a hardcoded 16-byte
+constant XORed with the device's own identity string. So:
+
+* From a **package alone** → still nothing. ~2.84 million key candidates tested against a
+  known-plaintext oracle, all negative ([§7](#7-key-recovery-attempts-all-negative)).
+* From a **preserved install** (`runtime/{keystore,datastore}.dat`, ~2 kB) → the device RSA key,
+  the rights object and the CEK all come out offline, each step verified by a GCM tag.
+
+So the artifact worth hunting for is no longer a several-hundred-megabyte decrypted `res.pak`.
+It is two small files that ordinary app-data backups preserve.
 
 ---
 
@@ -125,13 +139,22 @@ For the worked example (37,393,698 bytes total):
 Standard XMLDSig, `rsa-sha256`, one `<Reference>` per entry, signed by a per-title certificate
 (`CN=<title id>`) chained to an **"Acrodea Root CA"** (Acrodea Inc., Europe Branch, Helsinki).
 
-The digests are computed over the **plaintext** of each entry, which gives two things:
+The digests are computed over the **as-shipped form of each entry**, i.e. over the *encrypted*
+bytes for entries that ship encrypted.
 
-1. A ready-made **verification oracle**: any candidate decryption can be checked instantly
-   against the signed digest.
-2. Proof that decrypted content is **not device-specific**. The signed digest is a fixed
-   constant shipped identically to every user, so the correct plaintext is byte-identical for
-   everyone. See [§5](#5-imei-is-identity-not-the-key).
+> **Correction.** An earlier revision of this document claimed the digests covered the
+> **plaintext**, and offered them as a decryption oracle. That is wrong. Measured on a publicly
+> archived install of a sister title: its `signature.xml` lists the SHA-256 of the **encrypted**
+> executable, and the digest of the decrypted ELF appears in none of that manifest's 1,329
+> `<Reference>` entries. Treat these digests as packaging checksums, not as a way to validate a
+> candidate decryption.
+>
+> The real oracle is the cipher itself: content is `IV(16) ‖ ciphertext ‖ GCM tag(16)`, so a
+> correct CEK authenticates itself ([§5](#5-the-local-key-stores-open-offline)).
+
+Content still being **universal** (not per-device) does not depend on that retracted claim — it
+follows from the package being a static Google Play expansion file served byte-identically to
+every user. See [§5](#5-the-local-key-stores-open-offline).
 
 ---
 
@@ -163,42 +186,173 @@ Driver: `Security::ExeDRMHandler::postLoadHook` plus a statically-linked `LDVali
 
 ### Provisioning flow
 
-1. Device generates **its own RSA keypair** (`/data/keystore.dat`; `read /dev/random`,
-   `InvertibleRSAFunction` private-key ops are present).
-2. Device sends `device_id` + its **public key** (`/ro_request`). `device_id` is an HMAC-SHA256
-   fingerprint of IMEI/IMSI/MAC, produced in the Java layer by `com.ggee.utils.service.v` with
-   the embedded key `j5d!sf%w08gfy#tf`.
+1. Device generates **its own RSA keypair** — 1024-bit, public exponent **17** (not 65537) —
+   stored in `/data/keystore.dat`.
+2. Device sends `device_id` + its **public key** (`/ro_request`). `device_id` is
+   **`base64(SHA-256(identity))`**, where `identity` is the string described in
+   [§5](#5-the-local-key-stores-open-offline).
 3. Server returns a rights object whose payload is **hybrid-encrypted to that public key**
    (`/ro_response/key` + `/ro_response/payload`), carrying the **CEK**.
 4. `bootstrap.exe` unwraps with the device private key → CEK → decrypts the content region.
    The RO is cached in `datastore.dat`, so launches work offline afterwards.
 
+> **Correction.** An earlier revision described `device_id` as an HMAC-SHA256 of IMEI/IMSI/MAC
+> keyed with an app constant. Measured against a real rights object, it is a **plain SHA-256** of
+> the identity string, base64-encoded — no HMAC and no secret key involved.
+
 **The client reads the CEK from `/ro/cek`. It never derives it.** There is no KDF from device
-identity to content key anywhere in the binaries.
+identity to content key anywhere in the binaries. Device identity protects the *envelope*, which
+is a different thing and is what [§5](#5-the-local-key-stores-open-offline) attacks.
 
 ---
 
-## 5. IMEI is identity, not the key
+## 5. The local key stores open offline
 
 The TDC2013 slides say the key is "generated on the basis of User ID (IMSI, IMEI, etc.)", which
-reads as if content were encrypted per-device. It isn't, and that reading is the most natural
-wrong turn to take here.
+reads as if content were encrypted per-device. It isn't — but device identity is not decorative
+either. It is the XOR pad protecting the local key stores, and that is the way in.
 
-There are two separate keys:
+Two separate keys, as before:
 
-* **CEK**, which encrypts the content. Random, and **global** (one value for the title).
-* **Device binding**, which wraps the CEK for one device. This is what device identity selects.
+* **CEK** — encrypts the content. Random, server-generated, **global** for the title.
+* **Device binding** — wraps the CEK for one device. This is what identity selects.
 
-Why per-device content encryption can't be true: on Android these titles ship the content as a
-**Google Play expansion file** (the APK bundles `com.google.android.vending.expansion.downloader`,
-and the file uses the standard `main.<versionCode>.<package>.obb` naming). Google serves that
-file **byte-identical to every user**, and one static blob cannot be encrypted under billions of
-different IMEIs. The manifest also signs a fixed plaintext digest ([§3](#signaturexml)), which is
-only possible if the intended plaintext is universal.
+Content cannot be per-device: on Android these titles ship as a **Google Play expansion file**
+(the APK bundles `com.google.android.vending.expansion.downloader`, standard
+`main.<versionCode>.<package>.obb` naming), served **byte-identical to every user**. One static
+blob cannot be encrypted under billions of different IMEIs. So a decrypted package from any one
+device is valid for everyone: *the encryption was the binding*.
 
-Device identity decided *which rights object was yours*, not *how the content was encrypted*.
-Knowing an IMEI buys nothing: the content was never encrypted with one, the CEK isn't derived
-from one, and the actual wrapping key is a random device-generated RSA key.
+### The identity string
+
+`bootstrap.exe` obtains it through OpenKODE, always with the same attribute:
+
+```
+kdQueryAttribcv(0x24d)
+  → __kdExtensionAttribcv → __kdExtensionDeviceAttribcv        (libacrodea_runtime.so)
+      switch: 0x24d → IMEI, 0x24e → IMSI, 0x29 → platform info
+  → __acbDeviceGetIMEI → ExtensionACR::DeviceGetIMEI → JNI
+  → MyDevice.getImei()                                          (classes.dex)
+```
+
+and `MyDevice.getImei()` returns a **prefix plus an identifier**:
+
+```
+"IMEI:" + TelephonyManager.getDeviceId()          when telephony reports one
+"MACW:" + wifiMac.replaceAll(":", "")             otherwise (tablets, Wi-Fi-only devices)
+```
+
+On the Wi-Fi path the app caches that MAC in its own `SharedPreferences` under `PREF_MAC_ADDR`
+(AES/ECB/PKCS5 with an app-embedded key), so **a dump that includes `shared_prefs/` carries its
+own identity** — nothing needs to be known about the device from outside.
+
+### Store encryption
+
+Both stores use the same construction:
+
+```
+key16  = CONST16 XOR identity          # cyclic over identity, first 16 bytes only
+key    = key16 ‖ 16 zero bytes         # AES-256
+file   = IV(16) ‖ AES-256-GCM(plaintext) ‖ tag(16)
+```
+
+with two constants lifted from `bootstrap.exe`:
+
+```
+keystore.dat   fd 17 49 54 5e d2 5a b4 66 98 c6 c9 f4 3c e8 91
+datastore.dat  9a 18 cf b1 ba a6 ea 63 66 30 92 03 5b a1 78 41
+```
+
+These are **identical across runtime builds and titles** (verified byte-for-byte in two
+independently sourced `bootstrap.exe` binaries, years apart), so only the identity varies.
+`tools/extract_store_keys.py` re-derives them from any build.
+
+**Decoy.** The constants are built on top of an ASCII string, `oYga9NQJHQqbnZhe`, that sits in
+`.rodata` immediately before `/data/keystore.dat` and is referenced from all the store handling.
+It is never used: all 16 of its bytes are overwritten before use — twice, once with a dead decoy
+word set and once with the real one. Any effort spent deriving keys from that string is wasted.
+
+```cpp
+std::string k("oYga9NQJHQqbnZhe", 16);      // only sizes the buffer
+*(u32*)&k[0] = A0; … *(u32*)&k[12] = A3;    // decoy, immediately overwritten
+*(u32*)&k[8] = B2; *(u32*)&k[4]  = B1;      // the real constant
+*(u32*)&k[12]= B3; *(u32*)&k[0]  = B0;
+for (i = 0, p = id.begin(); i < k.size(); ++i, ++p) {
+    if (p == id.end()) p = id.begin();
+    k[i] ^= *p;                              // id = kdQueryAttribcv(0x24d)
+}
+```
+
+### Store container format
+
+```
+u32 count
+count × { u32 type; u32 id; u32 length; u8 data[length] }
+```
+
+`keystore.dat` holds two entries: the device **RSA private key** under id `0x5d66a128`, and its
+matching public key as a plain X.509 `SubjectPublicKeyInfo` under id `0x046cc7f6`. The private
+key entry is additionally **XOR-obfuscated with the same identity string**; undo that and it is a
+textbook PKCS#8 `PrivateKeyInfo`. `datastore.dat` holds one entry, keyed by the four ASCII bytes
+of the app id, containing the verbatim `ro_response` XML the server sent.
+
+### The full chain
+
+Every step is checked by a GCM authentication tag, so nothing here is guesswork:
+
+| # | Input | Operation | Output |
+|---|---|---|---|
+| 1 | wifi MAC or IMEI | `"MACW:"+mac` / `"IMEI:"+imei` | identity |
+| 2 | `keystore.dat` | AES-256-GCM, key = `KS_CONST xor identity` | key store |
+| 3 | entry `0x5d66a128` | XOR identity | PKCS#8 RSA-1024 private key |
+| 4 | `datastore.dat` | AES-256-GCM, key = `DS_CONST xor identity` | `<ro_response>` |
+| 5 | `<key>` | RSA-**OAEP(SHA-1)** with the device key | 32-byte session key |
+| 6 | `<payload>` | AES-256-GCM with the session key | `<ro>` → `<cek>`, `<pek>` |
+| 7 | content file | AES-256-GCM with the CEK | plaintext |
+
+`tools/ggee_drm.py` runs the whole thing. Verified end to end on the publicly archived
+**Shantae: Risky's Revenge** (`com.ggee.vividruntime.gs_1277`, v12.04.03) install: the CEK came out, and
+`iShantae.exe` decrypted — GCM tag verified — to a valid ARM ELF (`e_machine=40`,
+`e_flags=0x5000002`, ARMv5TE soft-float). The same CEK applied to Ghost Trick's `.exe` fails the
+tag, as it must: **the CEK is per title**. (No key material from that dump is reproduced here —
+only that the method works on it.)
+
+### The rights object can be re-issued for another device
+
+The RO carries **no server signature**. Its only integrity check is the GCM tag over `<payload>`,
+computed with a session key the *issuer* chooses and wraps to the device's own public key — and
+that public key lives in the device's own keystore. So once a title's CEK is known, a valid
+`keystore.dat` + `datastore.dat` pair can be minted for **any** identity: generate a fresh RSA
+keypair, draw a session key, recompute `device_id`, re-seal. `tools/ggee_forge.py` does this.
+
+Round-trip check: forging for an invented MAC, then re-reading with `ggee_drm.py`, recovers the
+same CEK, and decrypting the title's executable with it produces a **byte-identical** result to
+decrypting via the genuine device's rights object.
+
+This proves the *format* is fully understood. Whether a live `bootstrap.exe` accepts a forged RO
+has not been tested, and it is moot for preservation: the practical path decrypts on a PC and
+ships plaintext content, which never involves an on-device rights object at all.
+
+### Limits
+
+* **Identity must be recoverable.** The brute-force fallback below only helps when the identity
+  derives from something readable off the device. Observed counter-example: on a rooted
+  BlueStacks 0.7.3.766 (Android 2.3.4) image, a freshly installed title generated a valid
+  `keystore.dat` on demand, but wrote no `PREF_MAC_ADDR`, exposed no telephony service, and the
+  file opened under **none** of the readable identifiers (emulated Wi-Fi MAC, eth0 MAC, serial,
+  android_id, prefix-only, empty) in any case or format. Real-device dumps behave correctly; that
+  emulator's `getImei()` returns something not externally observable.
+* **Brute force, when applicable.** `keystore.dat`'s GCM tag authenticates the whole derived key,
+  so identity guesses are individually verifiable, and a correct one additionally yields the
+  tell-tale store header (`count=2, type=4, id=0x5d66a128`). Measured ≈24,000 guesses/s
+  single-threaded, unoptimised. With a `"MACW:"` identity whose first three bytes are a known
+  vendor OUI, the remaining `16^6 ≈ 16.7 M` space is a ~12-minute sweep. A locally administered or
+  randomised MAC breaks that assumption.
+* **Only 16 of the identity's bytes protect the container**, because the key is 16 bytes and the
+  pad is applied cyclically from the start. A 17-character identity therefore has its last
+  character unused for the container key — two identities differing only in that character open
+  the same `keystore.dat`. The private-key entry XOR *does* cover the full string, so a wrong last
+  character still yields an unparsable PKCS#8 blob; validate the RSA key, not just the GCM tag.
 
 ---
 
@@ -206,7 +360,10 @@ from one, and the actual wrapping key is a random device-generated RSA key.
 
 ### Outer: AES over the whole content region
 
-Key = `/ro/cek`. See above. This is the layer that can't be broken.
+Key = `/ro/cek`. The cipher itself is not attackable, and the key is not in the package — but it
+is in the *rights object*, which is recoverable from a preserved install
+([§5](#5-the-local-key-stores-open-offline)). So this layer falls to a device dump, never to the
+package alone.
 
 ### Inner: a keyless `rand()` LCG scramble
 
@@ -296,8 +453,23 @@ Modes covered: ECB, CBC, CTR, OFB, CFB, across three IV candidates, **plus an IV
 test** (`AES_dec_K(C₁) ⊕ C₀ == P₁`) that would find the right key regardless of IV.
 
 **~2.84 million tests, zero hits**, which is what a properly random server-side key looks like.
-All AES keys embedded in `classes.dex` are also demonstrably local-use (device-ID HMAC,
+All AES keys embedded in `classes.dex` are also demonstrably local-use (SharedPreferences,
 in-app-billing payload, ad session, Google LVL obfuscator) and none relate to content.
+
+> **Caveat on the mode.** These sweeps modelled the region as CTR-family with the leading bytes
+> used directly as the counter block. The cipher is actually **AES-GCM**
+> ([§5](#5-the-local-key-stores-open-offline)), and with a 16-byte IV, GCM derives its starting
+> counter through GHASH — which depends on the key — so that keystream model does not describe
+> the real construction. The *conclusion* is unaffected (the key is not embedded anywhere in the
+> client, and no sweep of client binaries can find it), but any future sweep should test GCM
+> rather than raw CTR.
+>
+> One loose end, recorded rather than resolved: the encrypted region begins with exactly 32 bytes
+> before the first entry's local header, which is suggestively equal to GCM's IV + tag overhead —
+> yet the region is length-preserving in place, and all six `AuthenticatedDecryptionFilter`
+> constructions in `bootstrap.exe` pass `flags = 0x10` (`THROW_EXCEPTION` only, i.e. **MAC at
+> end**), `truncatedDigestSize = -1`. Those two facts do not yet reconcile. It does not matter
+> until a CEK is in hand, at which point the tag settles it immediately.
 
 ---
 
@@ -433,12 +605,17 @@ connectivity tests) are ordinary policy checks: a boolean, a branch, a server ro
 one dies to a one-line patch, and historically they did.
 
 The **content encryption** is a different category. It isn't asking a question you can answer
-wrongly, it's withholding information you don't have. You can branch past a license test. You
-cannot branch past a cipher, and no amount of patching or compute substitutes for a 128-bit key
-generated on a machine that has been offline since 2017.
+wrongly, it's withholding information you don't have. You can branch past a license test; you
+cannot branch past a cipher, and no amount of patching or compute substitutes for the random
+AES key. Attacking that key *cryptographically* remains hopeless.
 
-Everything gate-shaped in VIVID Runtime was defeated long ago. The one encryption-shaped thing
-is closed.
+But "withholding information" cuts both ways: the information was **cached on the device**. The
+key rides inside a rights object stored in `datastore.dat`, and that object's protection is a
+program constant plus the device's own identity, not a server secret
+([§5](#5-the-local-key-stores-open-offline)). So the honest statement is narrower than "closed":
+the cipher is unbreakable, but the key survives in any preserved install and comes back out
+offline. What is permanently gone is only the ability to *provision a new* device — not the
+ability to read a device that was provisioned while the servers lived.
 
 *(This repository documents the concept rather than publishing a step-by-step bypass recipe for
 the store/licensing checks.)*
@@ -455,18 +632,27 @@ the store/licensing checks.)*
 * Quantum (Grover) halves the exponent to ~2⁶⁴ for AES-128, still infeasible, irrelevant for
   AES-256, and nobody is aiming a quantum computer at a defunct mobile game.
 
-**By the artifact resurfacing: yes.** This is data archaeology, not cryptanalysis. What's needed
-is either:
+**By the artifact resurfacing: yes**, and the artifact is now much smaller than it used to be.
+This is data archaeology, not cryptanalysis. Either of these works:
 
 1. the installed game directory from a device (or backup) that installed the title while the
    servers were alive (~2013-2017), containing the **already-decrypted** `res.pak`,
    `<Title>.exe`, and `config.xml`; or
-2. that device's `datastore.dat` (rights object) + `keystore.dat` (its RSA private key) +
-   device id, from which the CEK can be unwrapped.
+2. **that device's `runtime/keystore.dat` + `runtime/datastore.dat`** (plus `shared_prefs/`, or
+   the device's Wi-Fi MAC / IMEI), from which the CEK is recovered offline by
+   `tools/ggee_drm.py` — see [§5](#5-the-local-key-stores-open-offline).
 
-Because the CEK is global and the signed digest is fixed, **a decrypted package from any one
-device is valid for everyone**: the encryption *was* the device binding, and once removed the
-plaintext is universal. Verify any candidate against the digest in `signature.xml`.
+Option 2 is the realistic one. Those files live under
+`/data/data/<package>/` and total **about 2 kB**, which is exactly what
+Titanium Backup, `adb backup` and rooted `/data/data` copies preserve — and exactly the kind of
+thing that survives in old phone backups when a several-hundred-megabyte game directory does not.
+Reading them off a device needs root; restoring an old backup image does not.
+
+Because the CEK is global, **a decrypted package from any one device is valid for everyone**: the
+encryption *was* the device binding, and once removed the plaintext is universal.
+
+Verify a candidate decryption by its **GCM tag**, not by `signature.xml` — those digests cover the
+as-shipped (encrypted) form, see the correction in [§3](#signaturexml).
 
 ### Where installed titles live on disk
 
@@ -485,7 +671,8 @@ locations** when searching a device or backup.
 ### Preservation status
 
 Community dumps of installed G-Gee game directories exist on the Internet Archive, covering at
-least Devil May Cry 4 Refrain (1760), Ghost Trick (1761), Disgaea (705) and Shantae (1277).
+least Devil May Cry 4 Refrain (1760), Ghost Trick (1761), Disgaea (705) and
+Shantae: Risky's Revenge (1277).
 These appear as `RuntimeApps/<id>/` trees with `res.pak` present as a normal file.
 
 Scope of what has actually been checked here: **one** `res.pak` from such a dump was inspected
@@ -500,7 +687,17 @@ No decrypted copy is known for many other titles, including the one used as the 
 in this document.
 
 If you have an old Android device or backup with G-Gee games installed, that game directory is
-the thing worth saving. Once the servers died, it became unreproducible.
+the thing worth saving — and so, now, is the **app-data directory**, even on its own:
+
+```
+/data/data/com.ggee.vividruntime.<id>/runtime/keystore.dat     ~850 B
+/data/data/com.ggee.vividruntime.<id>/runtime/datastore.dat    ~1.1 kB
+/data/data/com.ggee.vividruntime.<id>/shared_prefs/*.xml       ~700 B
+```
+
+Those three files are enough to recover that title's CEK, and the package itself is still
+downloadable from public APK mirrors. Once the servers died, the rights object became
+unreproducible — but it was *cached*, and that cache is what survives in backups.
 
 ---
 
@@ -508,16 +705,25 @@ the thing worth saving. Once the servers died, it became unreproducible.
 
 * Analysis and format documentation (this file).
 * Tooling that operates on files you supply: LZMA unwrapper, container/central-directory parser,
-  known-plaintext oracle, embedded-key sweeper, `fsPacked` LCG descrambler.
+  known-plaintext oracle, embedded-key sweeper, `fsPacked` LCG descrambler, offline rights-object
+  recovery, rights-object re-issuing, and a store-constant extractor.
 * **Not included:** any APK, expansion package, `res.pak`, game asset, or other copyrighted
-  binary, and no signing keys.
+  binary; no signing keys; and **no rights objects, device keys, content keys or device
+  identifiers** from any real install. The constants published here are program constants read
+  out of the runtime's own binaries, not anyone's key material.
+
+This is preservation research on a platform whose servers have been offline since ~2017. The
+tooling only operates on files a user already possesses, and recovering a rights object requires
+that device's own DRM material — it grants no access to anything a device owner could not already
+read from their own install.
 
 ## Credits
 
 Parts of the analysis, tooling and documentation in this repository were produced
 with the help of [Claude](https://claude.com/claude-code) (Anthropic): the
-known-plaintext oracle and key sweeps, the Ghidra tracing of the DRM path and the
-`fs_packed` scramble, and this write-up.
+known-plaintext oracle and key sweeps, the ARM disassembly of the store-key derivation
+in `bootstrap.exe`, the tracing of the DRM path and the `fs_packed` scramble, the offline
+rights-object recovery / re-issue tooling, and this write-up.
 
 ## License
 
