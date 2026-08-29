@@ -16,7 +16,7 @@ They operate only on files you supply; nothing here ships game data.
 
 `key_sweep.py`, `ggee_drm.py` and `ggee_forge.py` need `pycryptodome`; `extract_store_keys.py`
 needs `capstone`; the rest are standard library only. None of these tools contains or downloads
-any game data, key or device identifier — you supply the files.
+any game data, key or device identifier. You supply the files.
 
 The `embedded` sweep is deliberately exhaustive (every byte-aligned window), so a
 full-size binary takes several minutes. `metadata` runs in seconds.
