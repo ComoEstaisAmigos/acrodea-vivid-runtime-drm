@@ -330,9 +330,36 @@ Two runtime notes worth knowing if you're bringing this up on a modern OS:
   with the object allocated and hand-initialised by the caller. A static factory mangles to the
   same symbol and links silently while shifting every argument by one register.
 
-### Real `config.xml` shape
+### `config.xml`: what it is, and how to substitute it
 
-Recovered from a preserved (decrypted) package of a sister title:
+A title's own `config.xml` is the **first entry of the encrypted region**, so it cannot be
+recovered without the CEK. On a package where the region is encrypted it sits at offset `0x20`
+and reads as ciphertext instead of `PK\x03\x04`; inflating it fails.
+
+Two usable substitutes exist, and they behave differently.
+
+**1. The library config, in plaintext, inside the runtime `.rpk`.** Every `.rpk` carries its
+own `config.xml`, and the `.rpk` lives in the package's *unencrypted* tail, so this one is
+always readable:
+
+```xml
+<?xml version="1.0" encoding="utf-8" ?>
+<application xmlns="http://www.acrodea.com/ns/application/1.0"
+             id="lib4_6_3" build="4631" version="1.0.0" lib="lib4_6_3">
+  <name>lib4.6.3 armv5</name>
+  <icons><icon width="90" height="90">icon.png</icon></icons>
+</application>
+```
+
+It describes the *library bundle*, not the game: `id` is the library name, and there is no
+`<executable>` and no `<libraries>`. Useful as a schema reference, and it independently
+corroborates the ABI measurement above — Acrodea's own label for the bundle is **`armv5`**.
+
+**2. A reconstructed app config**, same namespace and attribute layout, with the app-specific
+fields filled in: the title `id`, `<executable><Title>.exe</executable>`,
+`<libraries><runtime lib></libraries>` (replacing the library file's `lib=` attribute), and a
+`platformversion`. For reference, the genuine shape recovered from a preserved (decrypted)
+package of another title:
 
 ```xml
 <?xml version="1.0" encoding="utf-8"?>
@@ -350,10 +377,35 @@ Recovered from a preserved (decrypted) package of a sister title:
 </application>
 ```
 
-Useful diagnostic: with a valid `config.xml` present but content missing, the loader fails with
-`0x0e030300` (short read; `fs_packed` falls back to loose-directory mode and the loader ends up
-`fopen`-ing a *directory*, whose `fread` returns 0). With no `config.xml` at all,
-`bootstrap.exe`'s entry point returns `0xffffffff` because it doesn't know what to load.
+### Loader error codes, and what actually drives them
+
+Measured on an Android 12 device against a title whose content region is still encrypted, with
+the genuine runtime `.rpk` in place (its SHA-256 verified against the digest signed in
+`signature.xml`). **The error you get is decided by `config.xml`, not by the content archive:**
+
+| `config.xml` supplied | Code | Dialog |
+|---|---|---|
+| none | `0xffffffff` | — |
+| the library config from the `.rpk` (no `<executable>`) | `0x0e030300` | "Unexpected error has occurred… load error" |
+| a reconstructed app config naming `<Title>.exe` | `0x0e030700` | "Required game data is either deleted or broken" |
+
+* `0xffffffff` — `bootstrap.exe`'s entry point returns -1; with no config it does not know what
+  to load at all.
+* `0x0e030300` — short read. The config declares no `<executable>`, `fs_packed` falls back to
+  loose-directory mode and the loader ends up `fopen`-ing a *directory*, whose `fread` returns 0.
+* `0x0e030700` — module file could not be opened. The config names an executable, the loader
+  goes looking for that module, and it is not there. This is the furthest a deployment gets
+  without decrypted content.
+
+**The content archive is not what the loader trips on first.** Walking `res.pak` through
+absent, zero-length, and a real `OI` header with zero padding produced *no change* in the error
+code in any combination, with or without the runtime `.rpk` present. Nor did `build`,
+`version` or `platformversion` values matter. The blocker is the missing executable module,
+which is inside the encrypted region; the content archive only becomes relevant once a module
+exists to load.
+
+Corollary for anyone testing: **a synthetic content archive teaches nothing.** The next gate is
+a real `<Title>.exe`, so the experiment ladder stops there.
 
 ---
 
